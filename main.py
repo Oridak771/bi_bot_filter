@@ -484,7 +484,13 @@ def _read_xlsx_rows(path: Path) -> list[list[str]]:
             return []
 
         rel_id = first_sheet.attrib["{http://schemas.openxmlformats.org/officeDocument/2006/relationships}id"]
-        sheet_target = "xl/" + rel_map[rel_id]
+        target = rel_map[rel_id]
+        if target.startswith("/xl/"):
+            sheet_target = target.lstrip("/")
+        elif target.startswith("/"):
+            sheet_target = "xl" + target
+        else:
+            sheet_target = "xl/" + target
         sheet_root = ET.fromstring(workbook_zip.read(sheet_target))
 
         rows: list[list[str]] = []
