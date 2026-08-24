@@ -247,6 +247,29 @@ def api_run():
     return jsonify({"ok": True, "script": script, "test_email": test_email if test_mode else None})
 
 
+@app.post("/api/stop")
+def api_stop():
+    global _run_process
+    if not is_running():
+        return jsonify({"ok": False, "error": "Aucune exécution en cours."}), 400
+    try:
+        if _run_process is not None:
+            _run_process.terminate()
+            try:
+                _run_process.wait(timeout=3)
+            except subprocess.TimeoutExpired:
+                _run_process.kill()
+            _run_process = None
+        STATUS_PATH.parent.mkdir(parents=True, exist_ok=True)
+        STATUS_PATH.write_text(
+            json.dumps({"state": "idle", "phase": "done", "message": "Exécution interrompue par l'utilisateur."}),
+            encoding="utf-8",
+        )
+        return jsonify({"ok": True, "message": "Exécution arrêtée."})
+    except Exception as e:
+        return jsonify({"ok": False, "error": str(e)}), 500
+
+
 @app.get("/api/logs")
 def api_logs():
     if not LOG_PATH.exists():
@@ -353,6 +376,7 @@ INDEX_HTML = r"""<!DOCTYPE html>
           <label class="muted"><input type="checkbox" id="test-mode" style="width:auto;" onchange="toggleTestEmail()"/> Mode test</label>
           <input id="test-email" type="email" placeholder="adresse e-mail de test" style="width:230px;display:none;" title="Toutes les captures seront envoyées à cette adresse"/>
           <button class="btn" id="run-btn" onclick="startRun()">Lancer</button>
+          <button class="btn secondary" id="stop-btn" onclick="stopRun()" style="display:none;background:#fee2e2;color:#dc2626;">Arrêter</button>
         </div>
       </div>
       <div style="margin:16px 0 8px;">
@@ -394,10 +418,12 @@ function renderRecipients(){
   const body=$('#recipients-body');body.innerHTML='';
   recipients.forEach((r,i)=>{
     const tr=document.createElement('tr');
+    const toVal = r._to !== undefined ? r._to : (r.to||[]).join(', ');
+    const ccVal = r._cc !== undefined ? r._cc : (r.cc||[]).join(', ');
     tr.innerHTML=`
       <td><input value="${(r.filiale||'').replace(/"/g,'&quot;')}" oninput="recipients[${i}].filiale=this.value"/></td>
-      <td><textarea oninput="recipients[${i}]._to=this.value">${(r.to||[]).join(', ')}</textarea></td>
-      <td><textarea oninput="recipients[${i}]._cc=this.value">${(r.cc||[]).join(', ')}</textarea></td>
+      <td><textarea oninput="recipients[${i}]._to=this.value">${toVal.replace(/</g,'&lt;').replace(/>/g,'&gt;')}</textarea></td>
+      <td><textarea oninput="recipients[${i}]._cc=this.value">${ccVal.replace(/</g,'&lt;').replace(/>/g,'&gt;')}</textarea></td>
       <td><button class="btn ghost" onclick="recipients.splice(${i},1);renderRecipients()">✕</button></td>`;
     body.appendChild(tr);
   });
@@ -457,6 +483,12 @@ async function startRun(){
   if(!j.ok){toast(j.error||'Erreur');return;}
   toast(testMode?('Test lancé → '+j.test_email):'Exécution lancée');
 }
+async function stopRun(){
+  const res=await fetch('/api/stop',{method:'POST'});
+  const j=await res.json();
+  toast(j.message||j.error||'Arrêté');
+  pollStatus();
+}
 async function pollStatus(){
   try{
     const s=await (await fetch('/api/status')).json();
@@ -475,6 +507,7 @@ async function pollStatus(){
     if(s.phase==='done')pct=100;
     $('#progress-fill').style.width=pct+'%';
     $('#run-btn').disabled=!!s.running;
+    $('#stop-btn').style.display=s.running?'inline-block':'none';
   }catch(e){}
 }
 async function refreshLogs(){$('#logs').textContent=await (await fetch('/api/logs')).text()||'—';}

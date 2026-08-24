@@ -586,7 +586,32 @@ def load_mail_template(path: str = "mail_message.txt") -> MailTemplate:
     )
 
 
+def _col_ref_to_index(ref: str) -> int:
+    """Convert Excel cell reference column string like 'A', 'B', 'Z', 'AA' to 0-based column index."""
+    col_str = re.sub(r"[^A-Za-z]", "", ref).upper()
+    idx = 0
+    for char in col_str:
+        idx = idx * 26 + (ord(char) - ord('A') + 1)
+    return max(0, idx - 1)
+
+
 def _read_xlsx_rows(path: Path) -> list[list[str]]:
+    # Try openpyxl first if available
+    try:
+        import openpyxl
+        wb = openpyxl.load_workbook(path, data_only=True)
+        ws = wb.active
+        if ws is None:
+            return []
+        rows: list[list[str]] = []
+        for row_tuple in ws.iter_rows(values_only=True):
+            row_vals = [str(c if c is not None else "").strip() for c in row_tuple]
+            rows.append(row_vals)
+        return rows
+    except Exception:
+        pass
+
+    # Fallback to direct Zip/XML parsing
     ns = {
         "a": "http://schemas.openxmlformats.org/spreadsheetml/2006/main",
         "r": "http://schemas.openxmlformats.org/officeDocument/2006/relationships",
@@ -610,29 +635,36 @@ def _read_xlsx_rows(path: Path) -> list[list[str]]:
 
         rel_id = first_sheet.attrib["{http://schemas.openxmlformats.org/officeDocument/2006/relationships}id"]
         target = rel_map[rel_id]
-        # Relationship targets can be absolute ("/xl/worksheets/sheet1.xml", as written
-        # by openpyxl) or relative to the xl/ folder ("worksheets/sheet1.xml", as written
-        # by Excel). Normalize both to a zip path.
         sheet_target = target.lstrip("/") if target.startswith("/") else "xl/" + target
         sheet_root = ET.fromstring(workbook_zip.read(sheet_target))
 
-        rows: list[list[str]] = []
+        rows = []
         for row in sheet_root.findall("a:sheetData/a:row", ns):
-            values: list[str] = []
+            cell_dict: dict[int, str] = {}
+            max_col = -1
             for cell in row.findall("a:c", ns):
+                ref = cell.attrib.get("r", "")
+                col_idx = _col_ref_to_index(ref) if ref else len(cell_dict)
+                max_col = max(max_col, col_idx)
+
                 cell_type = cell.attrib.get("t")
                 value_node = cell.find("a:v", ns)
                 value = ""
                 if cell_type == "s" and value_node is not None and value_node.text is not None:
-                    value = shared_strings[int(value_node.text)]
+                    idx = int(value_node.text)
+                    if 0 <= idx < len(shared_strings):
+                        value = shared_strings[idx]
                 elif cell_type == "inlineStr":
                     inline_node = cell.find("a:is", ns)
                     if inline_node is not None:
                         value = "".join(node.text or "" for node in inline_node.findall(".//a:t", ns))
                 elif value_node is not None and value_node.text is not None:
                     value = value_node.text
-                values.append(value.strip())
-            rows.append(values)
+                cell_dict[col_idx] = value.strip()
+
+            if max_col >= 0:
+                values = [cell_dict.get(i, "") for i in range(max_col + 1)]
+                rows.append(values)
         return rows
 
 
@@ -654,11 +686,25 @@ def load_recipient_mappings(path: str = "destinataire.xlsx") -> dict[str, Recipi
             continue
         to_value = row[1] if len(row) > 1 else ""
         cc_value = row[2] if len(row) > 2 else ""
-        mappings[normalize_option_key(option)] = RecipientGroup(
-            to=parse_email_list(to_value),
-            cc=parse_email_list(cc_value),
-            original_name=option,
-        )
+        norm_key = normalize_option_key(option)
+        new_to = parse_email_list(to_value)
+        new_cc = parse_email_list(cc_value)
+
+        if norm_key in mappings:
+            # Merge and deduplicate emails preserving order
+            existing = mappings[norm_key]
+            for addr in new_to:
+                if addr not in existing.to:
+                    existing.to.append(addr)
+            for addr in new_cc:
+                if addr not in existing.cc:
+                    existing.cc.append(addr)
+        else:
+            mappings[norm_key] = RecipientGroup(
+                to=new_to,
+                cc=new_cc,
+                original_name=option,
+            )
     return mappings
 
 
@@ -1313,8 +1359,8 @@ def get_slicer_options(frame: Any, settings: Settings, logger: logging.Logger) -
     
     logger.info("Opening slicer '%s' dropdown to extract options...", slicer_name)
     try:
-        # Locate dropdown menu inside the slicer
-        slicer_dropdown = frame.locator(f".slicer-container:has-text('{slicer_name}') .slicer-dropdown-menu")
+        # Locate dropdown menu inside the slicer safely
+        slicer_dropdown = frame.locator(".slicer-container").filter(has_text=slicer_name).locator(".slicer-dropdown-menu")
         # Reset dropdown state by pressing Escape (closes any open popups)
         try:
             frame.page.keyboard.press("Escape")
@@ -1383,7 +1429,8 @@ def select_slicer_option(frame: Any, option_text: str, settings: Settings, logge
     logger.info("Selecting slicer option '%s' on slicer '%s'", option_text, slicer_name)
     
     # Locate dropdown header to click
-    slicer_dropdown = frame.locator(f".slicer-container:has-text('{slicer_name}') .slicer-dropdown-menu")
+    slicer_container = frame.locator(".slicer-container").filter(has_text=slicer_name)
+    slicer_dropdown = slicer_container.locator(".slicer-dropdown-menu")
     
     try:
         # Reset dropdown state by pressing Escape (closes any open popups)
@@ -1393,7 +1440,7 @@ def select_slicer_option(frame: Any, option_text: str, settings: Settings, logge
             pass
 
         # 1. Clear previous selections if clear button is visible
-        clear_btn = frame.locator(f".slicer-container:has-text('{slicer_name}') .slicer-header-clear")
+        clear_btn = slicer_container.locator(".slicer-header-clear")
         if clear_btn.is_visible():
             clear_btn.click(force=True)
             logger.info("Cleared existing selections for slicer '%s'", slicer_name)
@@ -1404,8 +1451,8 @@ def select_slicer_option(frame: Any, option_text: str, settings: Settings, logge
         slicer_dropdown.click()
         frame.locator(".slicerText").first.wait_for(state="visible", timeout=10000)
 
-        # 3. Locate the option (case-insensitive substring match)
-        option_locator = frame.locator(f".slicerText:has-text('{option_text}')").first
+        # 3. Locate the option safely (case-insensitive substring match)
+        option_locator = frame.locator(".slicerText").filter(has_text=option_text).first
         found = False
         
         if option_locator.count() > 0:
@@ -1459,9 +1506,7 @@ def select_slicer_option(frame: Any, option_text: str, settings: Settings, logge
         # the screenshots would show the wrong or unfiltered data. Fail loudly instead.
         selected_text = ""
         try:
-            restatement = frame.locator(
-                f".slicer-container:has-text('{slicer_name}') .slicer-restatement"
-            ).first
+            restatement = slicer_container.locator(".slicer-restatement").first
             if restatement.count() > 0:
                 selected_text = restatement.inner_text().strip()
         except Exception:
