@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import ast
 import html
+import json
 import logging
 import os
 import re
@@ -10,6 +11,8 @@ import ssl
 import sys
 import time
 import zipfile
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from threading import Lock
 from urllib.parse import urlparse
 from dataclasses import dataclass, field
 from datetime import datetime
@@ -30,6 +33,124 @@ except ImportError:
     Playwright = Any
     sync_playwright = None
     PlaywrightError = Exception
+
+
+class ProgressReporter:
+    """Thread-safe progress writer. Persists a small JSON status file that the web
+    dashboard polls so the user can watch the capture + email phases and see an ETA."""
+
+    def __init__(self) -> None:
+        self._lock = Lock()
+        self._path: Path | None = None
+        self._start_monotonic: float | None = None
+        self._capture_start: float | None = None
+        self._email_start: float | None = None
+        self._data: dict[str, Any] = {}
+
+    def configure(self, path: Path) -> None:
+        with self._lock:
+            self._path = path
+            self._data = {
+                "state": "running",
+                "phase": "starting",
+                "started_at": datetime.now(dt_timezone.utc).isoformat(),
+                "updated_at": None,
+                "options_total": 0,
+                "options_done": 0,
+                "current_option": None,
+                "screenshots": 0,
+                "emails_total": 0,
+                "emails_sent": 0,
+                "eta_seconds": None,
+                "message": "Starting…",
+                "errors": [],
+            }
+            self._start_monotonic = time.monotonic()
+            self._write_locked()
+
+    def _write_locked(self) -> None:
+        if self._path is None:
+            return
+        self._data["updated_at"] = datetime.now(dt_timezone.utc).isoformat()
+        try:
+            tmp = self._path.with_suffix(".tmp")
+            tmp.write_text(json.dumps(self._data, ensure_ascii=False, indent=2), encoding="utf-8")
+            tmp.replace(self._path)
+        except Exception:
+            # Progress reporting must never break the actual job.
+            pass
+
+    def _recompute_eta_locked(self) -> None:
+        d = self._data
+        eta: float | None = None
+        if d["phase"] == "emailing" and self._email_start is not None:
+            done, total = d["emails_sent"], d["emails_total"]
+            remaining = max(total - done, 0)
+            per = (time.monotonic() - self._email_start) / done if done > 0 else 5.0
+            eta = remaining * per
+        elif d["phase"] == "capturing" and self._capture_start is not None:
+            done, total = d["options_done"], d["options_total"]
+            remaining = max(total - done, 0)
+            if done > 0:
+                eta = remaining * ((time.monotonic() - self._capture_start) / done)
+        d["eta_seconds"] = round(eta) if eta is not None else None
+
+    def begin_capture(self, options_total: int, message: str = "") -> None:
+        with self._lock:
+            self._data["phase"] = "capturing"
+            self._data["options_total"] = options_total
+            self._data["message"] = message or f"Capturing {options_total} option(s)…"
+            self._capture_start = time.monotonic()
+            self._recompute_eta_locked()
+            self._write_locked()
+
+    def option_started(self, option: str | None) -> None:
+        with self._lock:
+            self._data["current_option"] = option
+            self._write_locked()
+
+    def option_done(self) -> None:
+        with self._lock:
+            self._data["options_done"] += 1
+            self._recompute_eta_locked()
+            self._write_locked()
+
+    def add_screenshot(self) -> None:
+        with self._lock:
+            self._data["screenshots"] += 1
+            self._write_locked()
+
+    def begin_emailing(self, emails_total: int) -> None:
+        with self._lock:
+            self._data["phase"] = "emailing"
+            self._data["emails_total"] = emails_total
+            self._data["message"] = f"Sending {emails_total} email(s)…"
+            self._email_start = time.monotonic()
+            self._recompute_eta_locked()
+            self._write_locked()
+
+    def email_sent(self) -> None:
+        with self._lock:
+            self._data["emails_sent"] += 1
+            self._recompute_eta_locked()
+            self._write_locked()
+
+    def add_error(self, message: str) -> None:
+        with self._lock:
+            self._data["errors"].append(message)
+            self._write_locked()
+
+    def finish(self, state: str, message: str) -> None:
+        with self._lock:
+            self._data["state"] = state
+            self._data["phase"] = "done"
+            self._data["current_option"] = None
+            self._data["eta_seconds"] = 0
+            self._data["message"] = message
+            self._write_locked()
+
+
+PROGRESS = ProgressReporter()
 
 
 VISUAL_SELECTORS = [
@@ -108,7 +229,6 @@ class Settings:
     report_stable_interval_ms: int
     report_stable_polls: int
     post_tab_click_wait_ms: int
-    screenshot_prefix: str
     timezone: str
     auth_mode: str
     auth_server_whitelist: str
@@ -133,11 +253,11 @@ class Settings:
     email_from: str
     email_reply_to: str | None
     email_to: list[str]
-    email_subject_prefix: str
     expected_sheets: list[str]
     filter_slicer_name: str | None
     filter_slicer_page: str | None
     filter_exclude_options: list[str]
+    max_workers: int
 
     @property
     def browser_profile_dir(self) -> Path:
@@ -164,6 +284,7 @@ class CapturedScreenshot:
 class RecipientGroup:
     to: list[str]
     cc: list[str] = field(default_factory=list)
+    original_name: str = ""
 
 
 @dataclass
@@ -272,7 +393,6 @@ def load_settings() -> Settings:
         report_stable_interval_ms=get_env_int("REPORT_STABLE_INTERVAL_MS", "2000"),
         report_stable_polls=get_env_int("REPORT_STABLE_POLLS", "3"),
         post_tab_click_wait_ms=get_env_int("POST_TAB_CLICK_WAIT_MS", "5000"),
-        screenshot_prefix=get_env("SCREENSHOT_PREFIX", "pbirs") or "pbirs",
         timezone=get_env("TIMEZONE", "UTC") or "UTC",
         auth_mode=(get_env("AUTH_MODE", "none") or "none").strip().lower(),
         auth_server_whitelist=get_env("AUTH_SERVER_WHITELIST", "") or "",
@@ -297,11 +417,11 @@ def load_settings() -> Settings:
         email_from=get_env("EMAIL_FROM", "") or "",
         email_reply_to=get_env("EMAIL_REPLY_TO"),
         email_to=email_to,
-        email_subject_prefix=get_env("EMAIL_SUBJECT_PREFIX", "PBIRS Daily Capture") or "PBIRS Daily Capture",
         expected_sheets=parse_csv(get_env("EXPECTED_SHEETS")),
         filter_slicer_name=get_env("FILTER_SLICER_NAME"),
         filter_slicer_page=get_env("FILTER_SLICER_PAGE"),
         filter_exclude_options=parse_csv(get_env("FILTER_EXCLUDE_OPTIONS")),
+        max_workers=max(1, get_env_int("MAX_WORKERS", "1")),
     )
 
 
@@ -490,12 +610,10 @@ def _read_xlsx_rows(path: Path) -> list[list[str]]:
 
         rel_id = first_sheet.attrib["{http://schemas.openxmlformats.org/officeDocument/2006/relationships}id"]
         target = rel_map[rel_id]
-        if target.startswith("/xl/"):
-            sheet_target = target.lstrip("/")
-        elif target.startswith("/"):
-            sheet_target = "xl" + target
-        else:
-            sheet_target = "xl/" + target
+        # Relationship targets can be absolute ("/xl/worksheets/sheet1.xml", as written
+        # by openpyxl) or relative to the xl/ folder ("worksheets/sheet1.xml", as written
+        # by Excel). Normalize both to a zip path.
+        sheet_target = target.lstrip("/") if target.startswith("/") else "xl/" + target
         sheet_root = ET.fromstring(workbook_zip.read(sheet_target))
 
         rows: list[list[str]] = []
@@ -539,11 +657,12 @@ def load_recipient_mappings(path: str = "destinataire.xlsx") -> dict[str, Recipi
         mappings[normalize_option_key(option)] = RecipientGroup(
             to=parse_email_list(to_value),
             cc=parse_email_list(cc_value),
+            original_name=option,
         )
     return mappings
 
 
-def build_context(playwright: Playwright, settings: Settings) -> tuple[BrowserContext, Page]:
+def build_context(playwright: Playwright, settings: Settings, worker_index: int = 0) -> tuple[BrowserContext, Page]:
     common_context_args: dict[str, Any] = {
         "ignore_https_errors": True,
         "viewport": {"width": settings.viewport_width, "height": settings.viewport_height},
@@ -566,11 +685,18 @@ def build_context(playwright: Playwright, settings: Settings) -> tuple[BrowserCo
         if settings.edge_profile_directory:
             launch_args.append(f"--profile-directory={settings.edge_profile_directory}")
 
-        user_data_dir = (
+        # Persistent contexts lock their user-data dir, so parallel workers must each
+        # use a distinct one. Integrated Windows auth relies on the OS account (not the
+        # profile), so a fresh per-worker profile still authenticates via Negotiate/NTLM.
+        base_user_data_dir = (
             Path(settings.edge_user_data_dir).expanduser()
             if settings.edge_user_data_dir
             else settings.browser_profile_dir.resolve()
         )
+        if worker_index > 0:
+            user_data_dir = base_user_data_dir.parent / f"{base_user_data_dir.name}-w{worker_index}"
+        else:
+            user_data_dir = base_user_data_dir
         context = playwright.chromium.launch_persistent_context(
             user_data_dir=str(user_data_dir),
             headless=settings.headless,
@@ -697,7 +823,7 @@ def locate_report_frame(page: Page, settings: Settings, logger: logging.Logger) 
                 best_score = score
                 best_frame = frame
 
-            if snapshot["hasPowerBiApi"] or snapshot["visualCount"] > 0:
+            if snapshot["visualCount"] > 0:
                 logger.info(
                     "Selected report frame: href=%s | visuals=%s | tabs=%s | powerbi_api=%s",
                     snapshot["href"],
@@ -728,7 +854,7 @@ def wait_for_report_ready(frame: Any, settings: Settings, logger: logging.Logger
 
         renderable = (
             snapshot["spinnerCount"] == 0
-            and (snapshot["visualCount"] > 0 or snapshot["hasPowerBiApi"] or snapshot["tabCount"] > 0)
+            and (snapshot["visualCount"] > 0 or snapshot["tabCount"] > 0)
         )
 
         if renderable and signature == previous_signature:
@@ -1189,17 +1315,51 @@ def get_slicer_options(frame: Any, settings: Settings, logger: logging.Logger) -
     try:
         # Locate dropdown menu inside the slicer
         slicer_dropdown = frame.locator(f".slicer-container:has-text('{slicer_name}') .slicer-dropdown-menu")
+        # Reset dropdown state by pressing Escape (closes any open popups)
+        try:
+            frame.page.keyboard.press("Escape")
+        except Exception:
+            pass
+
+        # Open dropdown (now guaranteed to be closed)
         slicer_dropdown.click()
         
         # Wait for options to render
         frame.locator(".slicerText").first.wait_for(state="visible", timeout=10000)
         
-        # Extract option texts
-        options_elements = frame.locator(".slicerText").all()
-        options = [el.inner_text().strip() for el in options_elements if el.inner_text().strip()]
+        # Collect options while scrolling to bypass virtualization
+        collected_options = set()
+        scroll_container = frame.locator(".slicer-dropdown-popup:visible .visibleGroup, .slicer-dropdown-popup:visible .scroll-content").first
         
-        # Close the dropdown
-        slicer_dropdown.click()
+        # Read initial options
+        for el in frame.locator(".slicerText").all():
+            text = el.inner_text().strip()
+            if text:
+                collected_options.add(text)
+                
+        if scroll_container.count() > 0:
+            current_scroll_top = 0
+            while current_scroll_top < 5000:
+                scroll_container.evaluate("el => { el.scrollTop += 150; el.dispatchEvent(new Event('scroll')); }")
+                time.sleep(0.3)
+                
+                for el in frame.locator(".slicerText").all():
+                    text = el.inner_text().strip()
+                    if text:
+                        collected_options.add(text)
+                        
+                new_scroll_top = scroll_container.evaluate("el => el.scrollTop")
+                if new_scroll_top == current_scroll_top:
+                    break
+                current_scroll_top = new_scroll_top
+                
+        options = sorted(list(collected_options))
+        
+        # Close the dropdown by pressing Escape
+        try:
+            frame.page.keyboard.press("Escape")
+        except Exception:
+            pass
         
         # Filter options
         exclude = set(settings.filter_exclude_options)
@@ -1213,40 +1373,108 @@ def get_slicer_options(frame: Any, settings: Settings, logger: logging.Logger) -
 
 
 def select_slicer_option(frame: Any, option_text: str, settings: Settings, logger: logging.Logger) -> None:
-    """Clear selections, open the slicer dropdown, click the target option, and close it.
-    Uses a forced click to bypass overlay interception issues.
+    """Clear selections, open the slicer dropdown, search and click the target option, and close it.
+    Uses scrolling to handle virtualized options.
     """
     slicer_name = settings.filter_slicer_name
     if not slicer_name:
         return
 
     logger.info("Selecting slicer option '%s' on slicer '%s'", option_text, slicer_name)
+    
+    # Locate dropdown header to click
+    slicer_dropdown = frame.locator(f".slicer-container:has-text('{slicer_name}') .slicer-dropdown-menu")
+    
     try:
+        # Reset dropdown state by pressing Escape (closes any open popups)
+        try:
+            frame.page.keyboard.press("Escape")
+        except Exception:
+            pass
+
         # 1. Clear previous selections if clear button is visible
         clear_btn = frame.locator(f".slicer-container:has-text('{slicer_name}') .slicer-header-clear")
         if clear_btn.is_visible():
             clear_btn.click(force=True)
             logger.info("Cleared existing selections for slicer '%s'", slicer_name)
+            time.sleep(1)
+            wait_for_report_ready(frame, settings, logger, f"clear select: {slicer_name}")
 
-        # 2. Open dropdown
-        slicer_dropdown = frame.locator(f".slicer-container:has-text('{slicer_name}') .slicer-dropdown-menu")
-        slicer_dropdown.click(force=True)
+        # 2. Open dropdown (now guaranteed to be closed)
+        slicer_dropdown.click()
+        frame.locator(".slicerText").first.wait_for(state="visible", timeout=10000)
 
-        # 3. Locate the target option
+        # 3. Locate the option (case-insensitive substring match)
         option_locator = frame.locator(f".slicerText:has-text('{option_text}')").first
-        option_locator.wait_for(state="visible", timeout=10000)
-        # Ensure the element is in view before clicking
-        option_locator.scroll_into_view_if_needed()
-        # Use forced click to avoid overlay interception
-        option_locator.click(force=True)
-        logger.info("Clicked option '%s'", option_text)
+        found = False
+        
+        if option_locator.count() > 0:
+            found = True
+        else:
+            logger.info("Option '%s' not in DOM. Scrolling dropdown list...", option_text)
+            # Find the scroll container inside the visible popup
+            scroll_container = frame.locator(".slicer-dropdown-popup:visible .visibleGroup, .slicer-dropdown-popup:visible .scroll-content").first
+            if scroll_container.count() > 0:
+                current_scroll_top = 0
+                while current_scroll_top < 5000: # safety limit to prevent infinite loops
+                    # Scroll down by 150px
+                    scroll_container.evaluate("el => { el.scrollTop += 150; el.dispatchEvent(new Event('scroll')); }")
+                    time.sleep(0.3) # wait for DOM/virtual list update
+                    
+                    if option_locator.count() > 0:
+                        found = True
+                        break
+                        
+                    new_scroll_top = scroll_container.evaluate("el => el.scrollTop")
+                    if new_scroll_top == current_scroll_top:
+                        break # reached bottom
+                    current_scroll_top = new_scroll_top
 
-        # 4. Close dropdown
-        slicer_dropdown.click(force=True)
+        if not found:
+            raise ValueError(f"Slicer option '{option_text}' not found in dropdown list.")
+
+        # Scroll option into view and select it (clicking left side to bypass scrollbar)
+        option_locator.scroll_into_view_if_needed()
+        option_locator.click(force=True, position={"x": 10, "y": 10})
+        logger.info("Clicked option '%s'", option_locator.inner_text().strip())
+
+        # 5. Close dropdown if still open
+        is_open = frame.locator(".slicer-dropdown-popup:visible").count() > 0
+        if is_open:
+            slicer_dropdown.click()
+            time.sleep(0.5)
+            if frame.locator(".slicer-dropdown-popup:visible").count() > 0:
+                try:
+                    frame.page.keyboard.press("Escape")
+                except Exception:
+                    pass
 
         # Allow the report to stabilize after changing the filter
         time.sleep(settings.post_tab_click_wait_ms / 1000)
         wait_for_report_ready(frame, settings, logger, f"option select: {option_text}")
+
+        # 6. Verify the filter actually applied. A single-select dropdown shows the
+        # chosen value in its collapsed restatement text; if it does not reflect the
+        # target option, the click silently missed (virtualization / stale node) and
+        # the screenshots would show the wrong or unfiltered data. Fail loudly instead.
+        selected_text = ""
+        try:
+            restatement = frame.locator(
+                f".slicer-container:has-text('{slicer_name}') .slicer-restatement"
+            ).first
+            if restatement.count() > 0:
+                selected_text = restatement.inner_text().strip()
+        except Exception:
+            selected_text = ""
+
+        if selected_text and normalize_option_key(option_text) not in normalize_option_key(selected_text):
+            raise ValueError(
+                f"Slicer '{slicer_name}' did not apply option '{option_text}' "
+                f"(current selection reads '{selected_text}'). Aborting capture for this option "
+                "to avoid sending screenshots with the wrong filter."
+            )
+        logger.info("Verified slicer '%s' selection: '%s'", slicer_name, selected_text or option_text)
+        
     except Exception as error:
         logger.exception(
             "Failed to select slicer option '%s' for slicer '%s': %s",
@@ -1254,6 +1482,16 @@ def select_slicer_option(frame: Any, option_text: str, settings: Settings, logge
             slicer_name,
             error,
         )
+        # Attempt to close the dropdown if it was left open
+        try:
+            is_open = frame.locator(".slicer-dropdown-popup:visible").count() > 0
+            if is_open:
+                slicer_dropdown.click()
+                time.sleep(0.5)
+                if frame.locator(".slicer-dropdown-popup:visible").count() > 0:
+                    frame.page.keyboard.press("Escape")
+        except Exception:
+            pass
         raise
 
 
@@ -1301,10 +1539,7 @@ def capture_tab_screenshot(page: Page, frame: Any, output_path: Path) -> None:
     )
 
 
-def capture_report(settings: Settings, logger: logging.Logger) -> tuple[list[CapturedScreenshot], list[str]]:
-    screenshots: list[CapturedScreenshot] = []
-    errors: list[str] = []
-
+def _require_playwright() -> None:
     if sync_playwright is None:
         raise RuntimeError(
             "Playwright is not installed in this environment. "
@@ -1312,119 +1547,240 @@ def capture_report(settings: Settings, logger: logging.Logger) -> tuple[list[Cap
             "and then '.\\.venv\\Scripts\\python.exe -m playwright install chromium'."
         )
 
+
+def _open_and_prepare(
+    playwright: Playwright, settings: Settings, logger: logging.Logger, worker_index: int = 0
+) -> tuple[BrowserContext, Page, Any, Any | None, list[ReportTab]]:
+    """Open a browser context, navigate to the report, wait for it to render, and
+    discover the tabs. Shared by the option-discovery pass and every capture worker."""
+    context, page = build_context(playwright, settings, worker_index)
+    page.set_default_timeout(settings.navigation_timeout_ms)
+    page.set_default_navigation_timeout(settings.navigation_timeout_ms)
+
+    logger.info("[w%d] Opening report URL: %s", worker_index, settings.report_url)
+    try:
+        response = page.goto(settings.report_url, wait_until="domcontentloaded")
+    except PlaywrightError as error:
+        if "ERR_INVALID_AUTH_CREDENTIALS" in str(error):
+            raise RuntimeError(
+                "PBIRS authentication failed before the page loaded. "
+                "If AUTH_MODE=integrated, run the script under a Windows account that already has access "
+                "to the report and keep PBIRS_USERNAME/PBIRS_PASSWORD empty. "
+                "If the server uses a login form instead, set AUTH_MODE=form."
+            ) from error
+        raise
+    if response is not None:
+        logger.info("[w%d] Initial response status: %s", worker_index, response.status)
+        if response.status == 401 and settings.auth_mode == "none":
+            raise PermissionError(
+                "The report returned HTTP 401. Configure AUTH_MODE and credentials before running again."
+            )
+
+    page.wait_for_load_state("networkidle", timeout=settings.navigation_timeout_ms)
+    handle_login_form_if_needed(page, settings, logger)
+
+    report_frame = locate_report_frame(page, settings, logger)
+    wait_for_report_ready(report_frame, settings, logger, "initial load")
+    tabs, report_handle = discover_tabs(report_frame, settings, logger)
+
+    if not tabs:
+        logger.warning("[w%d] No tabs discovered. Capturing the current report surface as a single page.", worker_index)
+        tabs = [ReportTab(label="current_view", mode="dom", dom_index=0, is_active=True)]
+
+    return context, page, report_frame, report_handle, tabs
+
+
+def _resolve_slicer_tab(tabs: list[ReportTab], settings: Settings, logger: logging.Logger) -> tuple[ReportTab, list[ReportTab]]:
+    """Pick the slicer-hosting page and return it plus the tabs ordered with it first."""
+    slicer_tab = None
+    if settings.filter_slicer_page:
+        slicer_tab = next(
+            (t for t in tabs if t.label.strip().casefold() == settings.filter_slicer_page.strip().casefold()),
+            None,
+        )
+    if not slicer_tab:
+        logger.warning("Slicer page '%s' not found in discovered tabs. Using first tab.", settings.filter_slicer_page)
+        slicer_tab = tabs[0]
+
+    ordered_tabs = [slicer_tab] + [t for t in tabs if t is not slicer_tab]
+    return slicer_tab, ordered_tabs
+
+
+def _discover_live_options(settings: Settings, logger: logging.Logger) -> list[str]:
+    """Open the report once and read the real slicer options (the source of truth)."""
     with sync_playwright() as playwright:
-        context, page = build_context(playwright, settings)
+        context, _page, report_frame, report_handle, tabs = _open_and_prepare(playwright, settings, logger, 0)
         try:
-            page.set_default_timeout(settings.navigation_timeout_ms)
-            page.set_default_navigation_timeout(settings.navigation_timeout_ms)
+            slicer_tab, _ordered = _resolve_slicer_tab(tabs, settings, logger)
+            logger.info("Activating slicer page '%s' to retrieve live options...", slicer_tab.label)
+            activate_tab(report_frame, report_handle, slicer_tab, settings, logger)
+            return get_slicer_options(report_frame, settings, logger)
+        finally:
+            context.close()
 
-            logger.info("Opening report URL: %s", settings.report_url)
-            try:
-                response = page.goto(settings.report_url, wait_until="domcontentloaded")
-            except PlaywrightError as error:
-                if "ERR_INVALID_AUTH_CREDENTIALS" in str(error):
-                    raise RuntimeError(
-                        "PBIRS authentication failed before the page loaded. "
-                        "If AUTH_MODE=integrated, run the script under a Windows account that already has access "
-                        "to the report and keep PBIRS_USERNAME/PBIRS_PASSWORD empty. "
-                        "If the server uses a login form instead, set AUTH_MODE=form."
-                    ) from error
-                raise
-            if response is not None:
-                logger.info("Initial response status: %s", response.status)
-                if response.status == 401 and settings.auth_mode == "none":
-                    raise PermissionError(
-                        "The report returned HTTP 401. Configure AUTH_MODE and credentials before running again."
-                    )
 
-            page.wait_for_load_state("networkidle", timeout=settings.navigation_timeout_ms)
-            handle_login_form_if_needed(page, settings, logger)
+def _capture_options_worker(
+    worker_index: int,
+    options_chunk: list[str | None],
+    run_stamp: str,
+    dated_output_dir: Path,
+    settings: Settings,
+    logger: logging.Logger,
+) -> tuple[list[CapturedScreenshot], list[str]]:
+    """Open one browser and capture the given subset of filial options end-to-end."""
+    screenshots: list[CapturedScreenshot] = []
+    errors: list[str] = []
 
-            report_frame = locate_report_frame(page, settings, logger)
-            wait_for_report_ready(report_frame, settings, logger, "initial load")
-            tabs, report_handle = discover_tabs(report_frame, settings, logger)
+    with sync_playwright() as playwright:
+        context, page, report_frame, report_handle, tabs = _open_and_prepare(playwright, settings, logger, worker_index)
+        try:
+            slicer_tab, ordered_tabs = _resolve_slicer_tab(tabs, settings, logger)
 
-            if not tabs:
-                logger.warning("No tabs were discovered. Capturing the current report surface as a single page.")
-                tabs = [ReportTab(label="current_view", mode="dom", dom_index=0, is_active=True)]
-
-            if settings.filter_slicer_name:
-                # Filter by option flow
-                slicer_tab = None
-                if settings.filter_slicer_page:
-                    slicer_tab = next(
-                        (t for t in tabs if t.label.strip().casefold() == settings.filter_slicer_page.strip().casefold()),
-                        None
-                    )
-                if not slicer_tab:
-                    logger.warning("Slicer page '%s' not found in discovered tabs. Using first tab.", settings.filter_slicer_page)
-                    slicer_tab = tabs[0]
-                
-                # Activate the slicer page to extract options
-                logger.info("Activating slicer page '%s' to retrieve options...", slicer_tab.label)
-                activate_tab(report_frame, report_handle, slicer_tab, settings, logger)
-                
-                options = get_slicer_options(report_frame, settings, logger)
-                if not options:
-                    logger.warning("No filter options found. Capturing standard report tabs without filtering.")
-                    options = [None]
-                
-                run_stamp = timestamp_compact(settings.timezone)
-                dated_output_dir = settings.output_dir / run_stamp[:8]
-                dated_output_dir.mkdir(parents=True, exist_ok=True)
-                
-                screenshot_idx = 1
-                for option in options:
+            for option in options_chunk:
+                try:
+                    PROGRESS.option_started(option)
                     if option:
-                        # Return to the slicer page to switch filter
-                        logger.info("Switching to slicer page '%s' to select option '%s'...", slicer_tab.label, option)
+                        # Return to the slicer page and switch the filter. On success this
+                        # leaves us ON the slicer page with the report stabilized, so the
+                        # first tab (slicer_tab) needs no re-activation.
+                        logger.info("[w%d] Selecting option '%s'...", worker_index, option)
                         activate_tab(report_frame, report_handle, slicer_tab, settings, logger)
                         select_slicer_option(report_frame, option, settings, logger)
-                        
-                    for tab in tabs:
+
+                    for tab_index, tab in enumerate(ordered_tabs):
                         try:
-                            # Activate the target tab
-                            activate_tab(report_frame, report_handle, tab, settings, logger)
-                            
-                            # Construct filename
+                            is_slicer_page_first = option is not None and tab_index == 0 and tab is slicer_tab
+                            if not is_slicer_page_first:
+                                activate_tab(report_frame, report_handle, tab, settings, logger)
+
+                            try:
+                                page.mouse.move(10, 10)
+                            except Exception:
+                                pass
+
                             opt_segment = f"{sanitize_filename(option)}_" if option else ""
-                            filename = f"{screenshot_idx:02d}_{opt_segment}{sanitize_filename(tab.label)}_{run_stamp}.png"
+                            filename = f"{opt_segment}{tab_index + 1:02d}_{sanitize_filename(tab.label)}_{run_stamp}.png"
                             output_path = dated_output_dir / filename
-                            
+
                             capture_tab_screenshot(page, report_frame, output_path)
                             screenshots.append(CapturedScreenshot(path=output_path, tab_label=tab.label, option=option))
-                            logger.info("Saved screenshot: %s", output_path)
-                            screenshot_idx += 1
+                            PROGRESS.add_screenshot()
+                            logger.info("[w%d] Saved screenshot: %s", worker_index, output_path)
                         except Exception as error:
                             opt_msg = f" (Option: '{option}')" if option else ""
                             message = f"Tab '{tab.label}' failed{opt_msg}: {error}"
                             logger.exception(message)
                             errors.append(message)
-            else:
-                # Original tab-by-tab flow
-                run_stamp = timestamp_compact(settings.timezone)
-                dated_output_dir = settings.output_dir / run_stamp[:8]
-                dated_output_dir.mkdir(parents=True, exist_ok=True)
-
-                for index, tab in enumerate(tabs, start=1):
-                    try:
-                        if not (index == 1 and tab.is_active):
-                            activate_tab(report_frame, report_handle, tab, settings, logger)
-                        else:
-                            wait_for_report_ready(report_frame, settings, logger, tab.label)
-
-                        filename = f"{index:02d}_{sanitize_filename(tab.label)}_{run_stamp}.png"
-                        output_path = dated_output_dir / filename
-                        capture_tab_screenshot(page, report_frame, output_path)
-                        screenshots.append(CapturedScreenshot(path=output_path, tab_label=tab.label, option=None))
-                        logger.info("Saved screenshot: %s", output_path)
-                    except Exception as error:
-                        message = f"Tab '{tab.label}' failed: {error}"
-                        logger.exception(message)
-                        errors.append(message)
+                            PROGRESS.add_error(message)
+                except Exception as option_error:
+                    message = f"Failed to process option '{option}': {option_error}"
+                    logger.exception(message)
+                    errors.append(message)
+                    PROGRESS.add_error(message)
+                finally:
+                    PROGRESS.option_done()
         finally:
             context.close()
 
+    return screenshots, errors
+
+
+def _capture_all_tabs_worker(
+    run_stamp: str, dated_output_dir: Path, settings: Settings, logger: logging.Logger
+) -> tuple[list[CapturedScreenshot], list[str]]:
+    """No-filter flow: capture every tab once, sequentially, in a single browser."""
+    screenshots: list[CapturedScreenshot] = []
+    errors: list[str] = []
+
+    with sync_playwright() as playwright:
+        context, page, report_frame, report_handle, tabs = _open_and_prepare(playwright, settings, logger, 0)
+        try:
+            for index, tab in enumerate(tabs, start=1):
+                try:
+                    if not (index == 1 and tab.is_active):
+                        activate_tab(report_frame, report_handle, tab, settings, logger)
+                    else:
+                        wait_for_report_ready(report_frame, settings, logger, tab.label)
+
+                    try:
+                        page.mouse.move(10, 10)
+                    except Exception:
+                        pass
+
+                    filename = f"{index:02d}_{sanitize_filename(tab.label)}_{run_stamp}.png"
+                    output_path = dated_output_dir / filename
+                    capture_tab_screenshot(page, report_frame, output_path)
+                    screenshots.append(CapturedScreenshot(path=output_path, tab_label=tab.label, option=None))
+                    PROGRESS.add_screenshot()
+                    logger.info("Saved screenshot: %s", output_path)
+                except Exception as error:
+                    message = f"Tab '{tab.label}' failed: {error}"
+                    logger.exception(message)
+                    errors.append(message)
+                    PROGRESS.add_error(message)
+        finally:
+            PROGRESS.option_done()
+            context.close()
+
+    return screenshots, errors
+
+
+def capture_report(settings: Settings, logger: logging.Logger) -> tuple[list[CapturedScreenshot], list[str]]:
+    _require_playwright()
+
+    run_stamp = timestamp_compact(settings.timezone)
+    dated_output_dir = settings.output_dir / run_stamp[:8]
+    dated_output_dir.mkdir(parents=True, exist_ok=True)
+
+    if not settings.filter_slicer_name:
+        PROGRESS.begin_capture(1, "Capturing report tabs (no filter)…")
+        return _capture_all_tabs_worker(run_stamp, dated_output_dir, settings, logger)
+
+    # 1. Discover the real filial options once (source of truth = live slicer).
+    options: list[str | None] = list(_discover_live_options(settings, logger))
+    if not options:
+        logger.warning("No filter options found on the live slicer. Capturing report tabs without filtering.")
+        PROGRESS.begin_capture(1, "Capturing report tabs (no filter)…")
+        return _capture_all_tabs_worker(run_stamp, dated_output_dir, settings, logger)
+
+    logger.info("Will capture %d filial option(s): %s", len(options), options)
+    PROGRESS.begin_capture(len(options))
+
+    # 2. Partition options across workers (round-robin keeps chunks balanced).
+    worker_count = max(1, min(settings.max_workers, len(options)))
+    chunks: list[list[str | None]] = [options[i::worker_count] for i in range(worker_count)]
+    chunks = [chunk for chunk in chunks if chunk]
+
+    screenshots: list[CapturedScreenshot] = []
+    errors: list[str] = []
+
+    # 3. Run the chunks. A single chunk runs inline; multiple chunks run in parallel,
+    #    each in its own browser (own thread + own Playwright instance + own profile).
+    if len(chunks) == 1:
+        logger.info("Running capture sequentially (1 worker).")
+        screenshots, errors = _capture_options_worker(0, chunks[0], run_stamp, dated_output_dir, settings, logger)
+    else:
+        logger.info("Running capture with %d parallel workers.", len(chunks))
+        with ThreadPoolExecutor(max_workers=len(chunks)) as executor:
+            futures = {
+                executor.submit(
+                    _capture_options_worker, index, chunk, run_stamp, dated_output_dir, settings, logger
+                ): index
+                for index, chunk in enumerate(chunks)
+            }
+            for future in as_completed(futures):
+                worker_index = futures[future]
+                try:
+                    worker_screenshots, worker_errors = future.result()
+                    screenshots.extend(worker_screenshots)
+                    errors.extend(worker_errors)
+                except Exception as worker_error:
+                    message = f"Worker {worker_index} crashed: {worker_error}"
+                    logger.exception(message)
+                    errors.append(message)
+
+    # Keep output deterministic (workers finish out of order).
+    screenshots.sort(key=lambda capture: capture.path.name)
     return screenshots, errors
 
 
@@ -1487,9 +1843,18 @@ def _resolve_recipients_for_option(
     logger: logging.Logger,
 ) -> RecipientGroup:
     if option is not None:
-        mapped = mappings.get(normalize_option_key(option))
+        norm_opt = normalize_option_key(option)
+        mapped = mappings.get(norm_opt)
         if mapped and mapped.to:
             return mapped
+            
+        # Try substring match fallback
+        for key, group in mappings.items():
+            if key in norm_opt or norm_opt in key:
+                if group and group.to:
+                    logger.info("Found fuzzy recipient mapping match for option '%s' -> key '%s'", option, key)
+                    return group
+                    
         logger.warning(
             "No recipient mapping found for option '%s'. Falling back to EMAIL_TO from .env.",
             option,
@@ -1787,6 +2152,7 @@ def send_email(settings: Settings, logger: logging.Logger, captures: list[Captur
             smtp.ehlo()
         if settings.smtp_username and settings.smtp_password:
             smtp.login(settings.smtp_username, settings.smtp_password)
+        PROGRESS.begin_emailing(len(grouped_captures))
         for option, option_captures in grouped_captures.items():
             option_errors = _errors_for_option(errors, option)
             recipients = _resolve_recipients_for_option(option, recipient_mappings, settings, logger)
@@ -1876,11 +2242,15 @@ def send_email(settings: Settings, logger: logging.Logger, captures: list[Captur
                     ) from error
                 raise
 
+            PROGRESS.email_sent()
+            logger.info("Email sent for option '%s'.", option or "default")
+
 
 def main() -> int:
     settings = load_settings()
     ensure_directories(settings)
     logger = build_logger(settings)
+    PROGRESS.configure(settings.log_dir / "status.json")
     validate_settings(settings)
     validate_timezone(settings, logger)
     report_host = urlparse(settings.report_url).hostname
@@ -1894,14 +2264,20 @@ def main() -> int:
         logger.info("Integrated auth allowlist: %s", build_auth_server_allowlist(settings))
     logger.info("Starting PBIRS capture job.")
 
-    screenshots, errors = capture_report(settings, logger)
-    send_email(settings, logger, screenshots, errors)
+    try:
+        screenshots, errors = capture_report(settings, logger)
+        send_email(settings, logger, screenshots, errors)
+    except Exception as error:
+        PROGRESS.finish("error", f"Job failed: {error}")
+        raise
 
     if errors:
         logger.warning("Capture completed with %s tab error(s).", len(errors))
+        PROGRESS.finish("partial", f"Completed with {len(errors)} error(s).")
         return 1
 
     logger.info("Capture completed successfully.")
+    PROGRESS.finish("done", "Completed successfully.")
     return 0
 
 
