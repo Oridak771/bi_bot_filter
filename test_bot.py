@@ -106,6 +106,8 @@ def test_run_full_override_safety(monkeypatch):
         filter_slicer_page=None,
         filter_exclude_options=[],
         max_workers=1,
+        slicer_dropdown_wait_ms=0,
+        slicer_apply_wait_ms=0,
     )
 
     monkeypatch.setattr(run_full_override, "original_load_settings", lambda *a, **kw: mock_settings)
