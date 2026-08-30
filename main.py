@@ -1425,10 +1425,25 @@ def get_slicer_options(frame: Any, settings: Settings, logger: logging.Logger) -
             scrolled = frame.evaluate(
                 """
                 () => {
+                  const isVis = el => el && el.offsetParent !== null;
+                  // Try popup children first, then generic containers
+                  const popup = document.querySelector('.slicer-dropdown-popup');
+                  if (popup && isVis(popup)) {
+                    for (const cls of ['.visibleGroup', '.scroll-content']) {
+                      const child = popup.querySelector(cls);
+                      if (child && child.scrollHeight > child.clientHeight) {
+                        child.scrollTop += 250;
+                        child.dispatchEvent(new Event('scroll'));
+                        return true;
+                      }
+                    }
+                    if (popup.scrollHeight > popup.clientHeight) {
+                      popup.scrollTop += 250;
+                      popup.dispatchEvent(new Event('scroll'));
+                      return true;
+                    }
+                  }
                   const selectors = [
-                    '.slicer-dropdown-popup:visible .visibleGroup',
-                    '.slicer-dropdown-popup:visible .scroll-content',
-                    '.slicer-dropdown-popup',
                     '.slicer-dropdown-content',
                     '.slicerBody',
                     '.scroll-wrapper',
@@ -1541,10 +1556,22 @@ def select_slicer_option(frame: Any, option_text: str, settings: Settings, logge
         frame.evaluate(
             """
             () => {
+              const isVis = el => el && el.offsetParent !== null;
+              const popup = document.querySelector('.slicer-dropdown-popup');
+              if (popup && isVis(popup)) {
+                for (const cls of ['.visibleGroup', '.scroll-content']) {
+                  const child = popup.querySelector(cls);
+                  if (child && child.scrollHeight > child.clientHeight) {
+                    child.scrollTop = 0;
+                    return;
+                  }
+                }
+                if (popup.scrollHeight > popup.clientHeight) {
+                  popup.scrollTop = 0;
+                  return;
+                }
+              }
               const selectors = [
-                '.slicer-dropdown-popup:visible .visibleGroup',
-                '.slicer-dropdown-popup:visible .scroll-content',
-                '.slicer-dropdown-popup',
                 '.slicer-dropdown-content',
                 '.slicerBody',
                 '.scroll-wrapper',
@@ -1574,21 +1601,34 @@ def select_slicer_option(frame: Any, option_text: str, settings: Settings, logge
         clicked = frame.evaluate(
             """
             async (targetText) => {
-              const containerSelectors = [
-                '.slicer-dropdown-popup:visible .visibleGroup',
-                '.slicer-dropdown-popup:visible .scroll-content',
-                '.slicer-dropdown-popup',
-                '.slicer-dropdown-content',
-                '.slicerBody',
-                '.scroll-wrapper',
-                '.virtualizedScrollerContent',
-              ];
+              const isVis = el => el && el.offsetParent !== null;
               let container = null;
-              for (const sel of containerSelectors) {
-                const el = document.querySelector(sel);
-                if (el && el.scrollHeight > el.clientHeight) {
-                  container = el;
-                  break;
+              const popup = document.querySelector('.slicer-dropdown-popup');
+              if (popup && isVis(popup)) {
+                for (const cls of ['.visibleGroup', '.scroll-content']) {
+                  const child = popup.querySelector(cls);
+                  if (child && child.scrollHeight > child.clientHeight) {
+                    container = child;
+                    break;
+                  }
+                }
+                if (!container && popup.scrollHeight > popup.clientHeight) {
+                  container = popup;
+                }
+              }
+              if (!container) {
+                const selectors = [
+                  '.slicer-dropdown-content',
+                  '.slicerBody',
+                  '.scroll-wrapper',
+                  '.virtualizedScrollerContent',
+                ];
+                for (const sel of selectors) {
+                  const el = document.querySelector(sel);
+                  if (el && el.scrollHeight > el.clientHeight) {
+                    container = el;
+                    break;
+                  }
                 }
               }
               if (!container) {
